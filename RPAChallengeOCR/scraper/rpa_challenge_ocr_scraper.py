@@ -38,6 +38,7 @@ def parse_invoice_data(text: str) -> tuple[str, str, str, str]:
     )
 
 def run_scraper() -> None:
+    logger.info("Iniciando o scraper...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
@@ -78,4 +79,5 @@ def run_scraper() -> None:
         save_to_csv(data)
         page.locator('input[type="file"][name="csv"]').set_input_files(CSV_FILE)
         logger.info(f"Arquivo {CSV_FILE} enviado com sucesso.")
+        logger.info("Scraper finalizado com sucesso!")
         browser.close()
