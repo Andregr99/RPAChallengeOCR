@@ -1,0 +1,7 @@
+pandas
+playwright
+pytesseract
+Pillow
+python-dotenv
+rich
+requests
