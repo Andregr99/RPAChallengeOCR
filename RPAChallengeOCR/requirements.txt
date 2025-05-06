@@ -1,7 +1,6 @@
-pandas
-playwright
-pytesseract
-Pillow
-python-dotenv
-rich
-requests
+playwright==1.42.0
+pytesseract==0.3.10
+pillow==10.2.0
+requests==2.31.0
+python-dotenv==1.0.1
+rich==13.7.0

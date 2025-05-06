@@ -1,83 +1,174 @@
+from playwright.sync_api import sync_playwright, Page
 import os
 import re
+import csv
 import requests
 from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
 from PIL import Image
 import pytesseract
-from playwright.sync_api import Page, sync_playwright
 
-from config.settings import TESSERACT_CMD, INVOICE_DIR, CSV_FILE, TARGET_URL
+from config.settings import Settings
 from config.logger import logger
-from modules.database.db_handler import save_to_csv
-from scraper.exceptions import InvoiceProcessingError
 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-os.makedirs(INVOICE_DIR, exist_ok=True)
+class RPAChallengeOCR:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.playwright = sync_playwright().start()
+        self._initialize_browser()
+        logger.info("OCR Challenge initialized")
 
-def extract_text_from_image(image_url: str, invoice_id: str) -> str:
-    path = os.path.join(INVOICE_DIR, f"{invoice_id}.jpg")
-    response = requests.get(image_url)
-    with open(path, "wb") as f:
-        f.write(response.content)
-    return pytesseract.image_to_string(Image.open(path)).strip()
+    def _initialize_browser(self):
+        self.browser = self.playwright.chromium.launch(
+            headless=self.settings.HEADLESS,
+            args=["--start-maximized"],
+            channel="chrome"
+        )
+        self.context = self.browser.new_context(no_viewport=True)
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.settings.TIMEOUT)
 
-def parse_invoice_data(text: str) -> tuple[str, str, str, str]:
-    invoice_no = re.search(r"Invoice\s*(?:#\s*)?(\d+)", text)
-    invoice_date = re.search(r"(\d{4}-\d{2}-\d{2})", text)
-    company_name = re.search(r"(.*?)\s+INVOICE", text)
-    total_due = re.search(r"Total\s+([\d,.]+)", text)
+    def __enter__(self):
+        return self
 
-    if not all([invoice_no, invoice_date, company_name, total_due]):
-        raise InvoiceProcessingError("Falha ao extrair dados do OCR")
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.context.close()
+        self.browser.close()
+        self.playwright.stop()
+        logger.info("Browser closed")
 
-    return (
-        invoice_no.group(1),
-        datetime.strptime(invoice_date.group(1), "%Y-%m-%d").strftime("%d-%m-%Y"),
-        company_name.group(1).strip(),
-        total_due.group(1),
-    )
+    def _download_invoice_image(self, image_url: str, invoice_id: str) -> Path:
+        path = self.settings.INVOICE_DIR / f"{invoice_id}.jpg"
+        try:
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(response.content)
+            return path
+        except Exception as e:
+            logger.error(f"Failed to download invoice image: {e}")
+            raise
 
-def run_scraper() -> None:
-    logger.info("Iniciando o scraper...")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
-        page.goto(TARGET_URL)
-        page.get_by_role("button", name="START").click()
-        page.wait_for_selector("table")
+    def _extract_text_from_image(self, image_path: Path) -> str:
+        try:
+            pytesseract.pytesseract.tesseract_cmd = self.settings.TESSERACT_CMD
+            img = Image.open(image_path)
+            img = img.convert('L')  # Convert to grayscale
+            text = pytesseract.image_to_string(img).strip()
+            
+            if not text:
+                raise ValueError("OCR não retornou texto")
+                
+            return text
+        except Exception as e:
+            logger.error(f"OCR processing failed: {e}")
+            raise
 
-        data = []
+    def _parse_invoice_data(self, text: str) -> Dict[str, str]:
+        try:
+            invoice_no = re.search(r"Invoice\s*(?:#\s*)?(\d+)", text)
+            invoice_date = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+            company_name = re.search(r"(.*?)\s+INVOICE", text)
+            total_due = re.search(r"Total\s+([\d,.]+)", text)
 
-        while True:
-            for row in page.locator("table tbody tr").all():
-                columns = row.locator("td").all()
-                invoice_id = columns[1].inner_text().strip()
-                due_date_str = columns[2].inner_text().strip()
-                due_date = datetime.strptime(due_date_str, "%d-%m-%Y")
+            if not all([invoice_no, invoice_date, company_name, total_due]):
+                raise ValueError("Failed to extract invoice data")
 
-                if due_date <= datetime.today():
-                    with page.expect_popup() as popup_info:
-                        row.get_by_role("link").click()
-                    popup = popup_info.value
+            return {
+                "invoice_no": invoice_no.group(1),
+                "invoice_date": datetime.strptime(invoice_date.group(1), "%Y-%m-%d").strftime("%d-%m-%Y"),
+                "company_name": company_name.group(1).strip(),
+                "total_due": total_due.group(1)
+            }
+        except Exception as e:
+            logger.error(f"Data parsing failed: {e}")
+            raise
 
-                    image_url = popup.locator("img[src*='jpg']").get_attribute("src")
-                    text = extract_text_from_image(image_url, invoice_id)
-                    popup.close()
+    def _process_invoice(self, row) -> Optional[Dict[str, str]]:
+        invoice_id = row.locator("td:nth-child(2)").inner_text().strip()
+        due_date = row.locator("td:nth-child(3)").inner_text().strip()
 
-                    try:
-                        invoice_no, invoice_date, company, total = parse_invoice_data(text)
-                        data.append([invoice_id, due_date_str, invoice_no, invoice_date, company, total])
-                        logger.info(f"Fatura {invoice_id} processada com sucesso.")
-                    except InvoiceProcessingError as e:
-                        logger.error(f"Erro na fatura {invoice_id}: {e}")
+        try:
+            if datetime.strptime(due_date, "%d-%m-%Y") > datetime.now():
+                return None
 
-            next_btn = page.locator(".paginate_button.next")
-            if "disabled" in next_btn.get_attribute("class"):
-                break
-            next_btn.click()
+            with self.page.expect_popup() as popup_info:
+                row.get_by_role("link").click()
+            popup = popup_info.value
+            
+            try:
+                image_url = popup.locator("img[src*='jpg']").get_attribute("src")
+                image_path = self._download_invoice_image(image_url, invoice_id)
+                text = self._extract_text_from_image(image_path)
+                
+                invoice_data = self._parse_invoice_data(text)
+                result = {
+                    "invoice_id": invoice_id,
+                    "due_date": due_date,
+                    **invoice_data,
+                    "status": "success"
+                }
+                logger.info(f"Invoice {invoice_id} processed successfully")
+                return result
+            finally:
+                popup.close()
+                
+        except Exception as e:
+            logger.error(f"Error processing invoice {invoice_id}: {e}")
+            return {
+                "invoice_id": invoice_id,
+                "due_date": due_date,
+                "status": "failed",
+                "error": str(e)
+            }
 
-        save_to_csv(data)
-        page.locator('input[type="file"][name="csv"]').set_input_files(CSV_FILE)
-        logger.info(f"Arquivo {CSV_FILE} enviado com sucesso.")
-        logger.info("Scraper finalizado com sucesso!")
-        browser.close()
+    def _generate_csv(self, data: List[Dict[str, str]]) -> Path:
+        try:
+            with open(self.settings.CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+                if not data:
+                    return self.settings.CSV_FILE
+                
+                writer = csv.DictWriter(csvfile, fieldnames=data[0].keys())
+                writer.writeheader()
+                writer.writerows(data)
+            
+            logger.info(f"CSV generated at {self.settings.CSV_FILE}")
+            return self.settings.CSV_FILE
+        except Exception as e:
+            logger.error(f"CSV generation failed: {e}")
+            raise
+
+    def run(self) -> List[Dict[str, str]]:
+        results = []
+        
+        try:
+            self.page.goto(self.settings.TARGET_URL)
+            self.page.get_by_role("button", name="START").click()
+            self.page.wait_for_selector("table")
+            logger.info("Challenge started")
+
+            while True:
+                for row in self.page.locator("table tbody tr").all():
+                    result = self._process_invoice(row)
+                    if result:
+                        results.append(result)
+
+                next_btn = self.page.locator(".paginate_button.next")
+                if "disabled" in next_btn.get_attribute("class"):
+                    break
+                next_btn.click()
+
+            csv_path = self._generate_csv(results)
+            self.page.locator('input[type="file"][name="csv"]').set_input_files(str(csv_path))
+            logger.info("Results submitted successfully")
+
+            if not self.settings.HEADLESS:
+                screenshot_path = self.settings.RESULTS_DIR / "final.png"
+                self.page.screenshot(path=str(screenshot_path))
+                logger.info(f"Screenshot saved to {screenshot_path}")
+
+            return results
+        except Exception as e:
+            logger.error(f"OCR challenge failed: {e}")
+            raise
